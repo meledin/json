@@ -149,7 +149,6 @@ public class JSONParser {
 		StringBuilder buf;
 		int endChar = '"';
 		int escapeMode = START;
-		int unicodeChar = 0;
 
 		static final int START = -1;
 		static final int NONE = 0;
@@ -222,6 +221,7 @@ public class JSONParser {
 
 			case HEX2:
 			case UNICODE4:
+				numBuf.appendCodePoint(c);
 				buf.appendCodePoint((char) Integer.parseInt(numBuf.toString(), 16));
 				numBuf.setLength(0);
 				escapeMode = NONE;
@@ -246,6 +246,12 @@ public class JSONParser {
 			return true;
 		}
 
+		public StringGenerator reset() {
+			buf.setLength(0);
+			numBuf.setLength(0);
+			escapeMode = START;
+			return this;
+		}
 	}
 
 	static class ConstantGenerator implements Generator {
@@ -324,53 +330,65 @@ public class JSONParser {
 			return false;
 		}
 
+		public NumberGenerator reset() {
+			buf.setLength(0);
+			return this;
+		}
+
+	}
+
+	static class RootGenerator<T> implements Generator {
+
+		private Parser<T> parser;
+
+		public RootGenerator(Parser<T> parser) {
+			this.parser = parser;
+		}
+
+		@SuppressWarnings("unchecked")
+		@Override
+		public void accept(Object t, int c) {
+
+			if (t == null && c > -1)
+				throw new IllegalArgumentException("Cannot have more text at the root level: " + (char) c);
+
+			parser.rv = (T) t;
+		}
+
+		@Override
+		public boolean isTerminator(int c) {
+			return false;
+		}
+
+		@Override
+		public Object generate() {
+			return null;
+		}
+
+		@Override
+		public boolean explicitExit() {
+			return true;
+		}
 	}
 
 	static class Parser<T> {
 
-		ArrayDeque<Generator> stack = new ArrayDeque<>(32);
+		ArrayDeque<Generator> stack = new ArrayDeque<>(16);
 		Generator curr = null;
-		StringBuilder buf = new StringBuilder(64);
-		StringBuilder numBuf = new StringBuilder(64);
+		StringBuilder buf = new StringBuilder(32);
+		StringBuilder numBuf = new StringBuilder(32);
 		boolean stringParsingMode = false;
 		T rv;
 
-		T parse(String str) {
+		NumberGenerator nums = new NumberGenerator(buf);
+		StringGenerator strings = new StringGenerator(buf, numBuf);
 
-			NumberGenerator nums = new NumberGenerator(buf);
-			StringGenerator strings = new StringGenerator(buf, numBuf);
+		T parse(char[] str) {
 
-			stack.push(new Generator() {
-
-				@SuppressWarnings("unchecked")
-				@Override
-				public void accept(Object t, int c) {
-
-					if (t == null && c > -1)
-						throw new IllegalArgumentException("Cannot have more text at the root level");
-
-					rv = (T) t;
-				}
-
-				@Override
-				public boolean isTerminator(int c) {
-					return false;
-				}
-
-				@Override
-				public Object generate() {
-					return null;
-				}
-
-				@Override
-				public boolean explicitExit() {
-					return true;
-				}
-			});
-			
+			stack.push(new RootGenerator<T>(this));
 			curr = stack.peek();
-			
-			chars: for (char c : str.toCharArray()) {
+
+			nextLoop: for (char c : str) {
 				while (curr.isTerminator(c)) {
 					stringParsingMode = false;
 					Generator gen = stack.pop();
@@ -378,64 +396,64 @@ public class JSONParser {
 					Object object = gen.generate();
 					curr.accept(object, -1);
 					if (gen.explicitExit())
-						continue chars;
+						continue nextLoop;
 				}
 
 				if (stringParsingMode) {
 					curr.accept(null, c);
-					continue;
+					continue nextLoop;
 				}
 
-				if (Character.isWhitespace(c)) {
-					continue;
+				if (Character.isWhitespace(c))
+					continue nextLoop;
+
+				if (c == ':' || c == ',') {
+					curr.accept(null, c);
+					continue nextLoop;
+				}
+
+				// This has the risk of drawing in false positives, but they
+				// will be caught when the number tries to parse
+				// The benefit is that a bitmask is a LOT faster to execute.
+				if ((c & 0xF0) == '0') {
+					stringParsingMode = true;
+					stack.push(curr = nums.reset());
+					curr.accept(null, c);
+					continue nextLoop;
+				}
+
+				if ((c & 0x5F) == '[') {
+					if (c == '[') {
+						stack.push(curr = new ListGenerator());
+						continue nextLoop;
+					}
+					stack.push(curr = new MapGenerator());
+					continue nextLoop;
+
 				}
 
 				switch (c) {
-				case ':':
-				case ',':
-					curr.accept(null, c);
-					break;
-
-				case '{':
-					stack.push(curr = new MapGenerator());
-					break;
-
-				case '[':
-					stack.push(curr = new ListGenerator());
-					break;
 
 				case '"':
 				case '\'':
 					stringParsingMode = true;
-					stack.push(curr = strings);
-					buf.setLength(0);
-					numBuf.setLength(0);
+					stack.push(curr = strings.reset());
 					curr.accept(null, c);
-					break;
+					continue nextLoop;
 
-				case '0':
-				case '1':
-				case '2':
-				case '3':
-				case '4':
-				case '5':
-				case '6':
-				case '7':
-				case '8':
-				case '9':
+				case '+':
+				case '-':
 					stringParsingMode = true;
-					stack.push(curr = nums);
-					buf.setLength(0);
+					stack.push(curr = nums.reset());
 					curr.accept(null, c);
-					break;
+					continue nextLoop;
 
 				default:
 					stringParsingMode = true;
 					stack.push(curr = new ConstantGenerator());
 					curr.accept(null, c);
-					break;
+					continue nextLoop;
 				}
-
 			}
 
 			return rv;
@@ -447,10 +465,11 @@ public class JSONParser {
 	public static <T> T parse(String str) {
 
 		Parser<T> parser = new Parser<T>();
-		return parser.parse(str);
+		return parser.parse(str.toCharArray());
 	}
 
-	public static void main(String[] args) throws IOException {
+	public static void main(String[] args) throws IOException, InterruptedException {
+
 		StringBuffer sb = new StringBuffer();
 		Files.readAllLines(Paths.get("/tmp/catalog2.json")).forEach(line -> sb.append(line));
 		String src = sb.toString();
@@ -462,23 +481,22 @@ public class JSONParser {
 		 * System.out.println(System.currentTimeMillis() - start); }
 		 */
 
-		OptionalDouble average = LongStream.range(0, 2500).parallel().map(l -> {
+		OptionalDouble average = LongStream.range(0, 1250000).parallel().map(l -> {
 			long start = System.currentTimeMillis();
 			parse(src);
-			//new JSONDeserializer<>().deserialize(src);
 			return System.currentTimeMillis() - start;
-		}).skip(500).average();
+		}).skip(1500).average();
 
 		System.out.println(average.getAsDouble());
 
-		average = LongStream.range(0, 2500).parallel().map(l -> {
+		average = LongStream.range(0, 1250000).parallel().map(l -> {
 			long start = System.currentTimeMillis();
 			new JSONDeserializer<>().deserialize(src);
 			return System.currentTimeMillis() - start;
-		}).skip(500).average();
+		}).skip(1500).average();
 
 		System.err.println(average.getAsDouble());
-		
+
 	}
 
 }
